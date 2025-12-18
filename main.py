@@ -487,6 +487,45 @@ async def startup_event():
         # Прерываем запуск сервера при ошибке инициализации
         raise RuntimeError("Не удалось инициализировать приложение")
 
+def compress_image_if_large(image, max_pixels=1600*900):
+    """
+    Автоматически сжимает изображение если оно слишком большое
+    для работы в ограниченной памяти (512MB на Render.com)
+    
+    Args:
+        image: PIL Image объект
+        max_pixels: максимальное количество пикселей
+    
+    Returns:
+        PIL Image: сжатое изображение (если нужно) или оригинальное
+        float: коэффициент масштабирования (1.0 если не сжимали)
+    """
+    width, height = image.size
+    total_pixels = width * height
+    
+    # Если изображение меньше лимита - не сжимаем
+    if total_pixels <= max_pixels:
+        return image, 1.0
+    
+    # Вычисляем коэффициент сжатия
+    scale_factor = (max_pixels / total_pixels) ** 0.5
+    
+    # Новые размеры
+    new_width = int(width * scale_factor)
+    new_height = int(height * scale_factor)
+    
+    # Минимальные размеры для детекции
+    new_width = max(new_width, 320)
+    new_height = max(new_height, 320)
+    
+    print(f"📏 Сжимаем изображение: {width}x{height} -> {new_width}x{new_height}")
+    print(f"📊 Коэффициент сжатия: {scale_factor:.3f}")
+    
+    # Сжимаем с сохранением качества
+    compressed = image.resize((new_width, new_height), Image.Resampling.BILINEAR) # LANCZOS - качественнее, BILINEAR - бытрее
+    
+    return compressed, scale_factor
+
 @app.post("/predict/")
 async def predict(
     file: UploadFile = File(...),
@@ -536,14 +575,27 @@ async def predict(
         
         # Открываем изображение с помощью PIL
         image = Image.open(io.BytesIO(image_data))
-
+        original_size = image.size
+        
         # Конвертируем в RGB если нужно (для PNG с альфа-каналом)
         if image.mode in ('RGBA', 'LA', 'P'):
             image = image.convert('RGB')
             print("🔄 Конвертирован в RGB")
-      
-        image_array = np.array(image)
-        print(f"🖼️ Размер изображения: {image_array.shape}")
+        
+        # АВТОМАТИЧЕСКОЕ СЖАТИЕ ДЛЯ ЭКОНОМИИ ПАМЯТИ
+        compressed_image, scale_factor = compress_image_if_large(image)
+        
+        image_array = np.array(compressed_image)
+        print(f"🖼️ Размер изображения после сжатия: {image_array.shape}")
+
+        # Освобождаем память от оригинальных изображений
+        del image
+        del compressed_image
+        import gc
+        gc.collect()  # Принудительный сбор мусора
+        
+        if scale_factor != 1.0:
+            print(f"📊 Оригинальный размер: {original_size}")
         
         # Выполняем предсказание с помощью YOLO модели
         print(f"🔍 Выполнение предсказания YOLO с уверенностью {confidence}...")
@@ -566,7 +618,7 @@ async def predict(
                     # Получаем перевод названия класса на запрошенный язык
                     translated_label = get_label_translation(original_label, language)
                     
-                    print(f"  🏷️ Бокс {j}: {original_label} -> {translated_label} (ID: {class_id}), уверенность: {box_confidence:.3f}")
+                    print(f"  🏷️ Бокс {j+1}: {original_label} -> {translated_label} (ID: {class_id}), уверенность: {box_confidence:.3f}")
                     
                     # Формируем информацию о детекции
                     detection = {
@@ -578,7 +630,7 @@ async def predict(
                     }
                     detections.append(detection)
             else:
-                print(f"❌ Результат {i}: нет боксов")
+                print(f"❌ Результат: нет боксов")
         
         print(f"✅ Обработано детекций: {len(detections)}")
         
@@ -593,14 +645,27 @@ async def predict(
         
         # Конвертируем изображение в base64 для передачи в ответе
         annotated_pil = Image.fromarray(annotated_image)
+
+        # Освобождаем память от временных данных
+        del annotated_image
+        del results
+        del image_array
+        
         buffered = io.BytesIO()
-        annotated_pil.save(buffered, format="JPEG", quality=95)
+        annotated_pil.save(buffered, format="JPEG", quality=85)
+
+        # Освобождаем PIL изображение после сохранения
+        del annotated_pil
+        gc.collect()
         
         import base64
         image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         
         print(f"🎉 Успешно завершено. Возвращаем {len(detections)} детекций")
-        
+
+        # Освобождаем буфер
+        del buffered
+
         # Формируем и возвращаем ответ
         return {
             "success": True,
